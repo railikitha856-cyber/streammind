@@ -1,0 +1,6 @@
+# StreamMind local development secrets. Never commit real keys or OAuth tokens.
+.env
+.streamlit/secrets.toml
+.tio.tokens.json
+.venv/
+__pycache__/
