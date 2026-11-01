@@ -1,5 +1,6 @@
 """Background TwitchIO EventSub connection for StreamMind."""
 import asyncio
+import logging
 import os
 import queue
 import re
@@ -10,6 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv(encoding="utf-8-sig")
 CHANNEL_PATTERN = re.compile(r"^[a-zA-Z0-9_]{4,25}$")
+logger = logging.getLogger(__name__)
 
 
 class TwitchChatManager:
@@ -28,6 +30,25 @@ class TwitchChatManager:
         self._status = "Disconnected"
         self._running = False
         self._configured = False
+        self._client_closed = False
+        self._stop_requested = False
+        self._use_secret_tokens = False
+        self._secret_access_token = ""
+        self._secret_refresh_token = ""
+
+    @staticmethod
+    def _streamlit_secret(name):
+        """Read a value from Streamlit secrets without exposing it in the UI/logs."""
+        try:
+            import streamlit as st
+            return str(st.secrets.get(name, "") or "").strip()
+        except Exception:
+            return ""
+
+    @classmethod
+    def _setting(cls, name):
+        """Prefer hosted/local Streamlit secrets; use .env locally as fallback."""
+        return cls._streamlit_secret(name) or os.getenv(name, "").strip()
 
     @property
     def status(self):
@@ -49,11 +70,32 @@ class TwitchChatManager:
         """Start TwitchIO and prepare a subscription for a valid channel."""
         channel_name = (channel_name or "").strip().lstrip("#")
         if not CHANNEL_PATTERN.fullmatch(channel_name):
-            return "Enter a valid Twitch channel name (4–25 letters, numbers, or underscores)."
-        client_id = os.getenv("TWITCH_CLIENT_ID", "").strip()
-        client_secret = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
+            return self._fail("Enter a valid Twitch channel name (4–25 letters, numbers, or underscores).")
+        client_id = self._setting("TWITCH_CLIENT_ID")
+        client_secret = self._setting("TWITCH_CLIENT_SECRET")
         if not client_id or not client_secret:
-            return "Add TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET to your local .env file first."
+            return self._fail(
+                "Twitch credentials are missing. Set TWITCH_CLIENT_ID and "
+                "TWITCH_CLIENT_SECRET in Streamlit Cloud Secrets or your local .env file."
+            )
+
+        # Cloud Secrets are not a durable token store, and its localhost OAuth
+        # adapter cannot be reached by the browser. Require a user token pair there.
+        cloud_client_credentials = bool(
+            self._streamlit_secret("TWITCH_CLIENT_ID")
+            and self._streamlit_secret("TWITCH_CLIENT_SECRET")
+        )
+        self._secret_access_token = self._setting("TWITCH_ACCESS_TOKEN")
+        self._secret_refresh_token = self._setting("TWITCH_REFRESH_TOKEN")
+        self._use_secret_tokens = cloud_client_credentials and bool(
+            self._secret_access_token and self._secret_refresh_token
+        )
+        if cloud_client_credentials and not self._use_secret_tokens:
+            return self._fail(
+                "Streamlit Cloud needs TWITCH_ACCESS_TOKEN and TWITCH_REFRESH_TOKEN "
+                "Secrets for chat access. Authorize a Twitch user with the user:read:chat "
+                "scope, then add both tokens to Cloud Secrets."
+            )
         if self.running:
             if self._target_channel.lower() == channel_name.lower():
                 return ""
@@ -65,6 +107,8 @@ class TwitchChatManager:
         self._target_broadcaster_id = ""
         self._subscribed_user_ids.clear()
         self._set_status("Starting Twitch connection…", running=True)
+        self._client_closed = False
+        self._stop_requested = False
         self._loop_ready.clear()
         self._thread = threading.Thread(
             target=self._run_event_loop,
@@ -74,18 +118,23 @@ class TwitchChatManager:
         )
         self._thread.start()
         if not self._loop_ready.wait(timeout=5):
-            self._set_status("Could not start the Twitch background connection.", running=False)
-            return self.status
+            message = "Could not start the Twitch background connection."
+            self.stop()
+            return self._fail(message)
 
         future = asyncio.run_coroutine_threadsafe(self._prepare_channel(), self._loop)
         try:
             future.result(timeout=40)
         except Exception as error:
             message = self._friendly_error(error)
-            self._set_status(message, running=False)
+            logger.exception("Twitch channel preparation failed")
             self.stop()
-            return message
+            return self._fail(message)
         return ""
+
+    def _fail(self, message):
+        self._set_status(message, running=False)
+        return message
 
     @property
     def _loop_ready(self):
@@ -135,11 +184,13 @@ class TwitchChatManager:
 
                 async def event_error(self, payload):
                     error = getattr(payload, "exception", None)
+                    logger.error("TwitchIO event error: %s", error or payload)
                     self.manager._set_status(
                         self.manager._friendly_error(error or "Twitch reported a connection error.")
                     )
 
                 async def event_subscription_revoked(self, payload):
+                    logger.error("Twitch chat subscription was revoked: %s", payload)
                     self.manager._set_status(
                         "Twitch revoked the chat subscription. Disconnect and reconnect to authorize again."
                     )
@@ -147,36 +198,77 @@ class TwitchChatManager:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
             self._client = StreamMindTwitchClient(self)
-            self._start_task = self._loop.create_task(self._client.start())
+            # Cloud already has a stored user token and has no reachable localhost
+            # OAuth callback. Locally, keep TwitchIO's adapter/token-file flow.
+            self._start_task = self._loop.create_task(
+                self._client.start(
+                    with_adapter=not self._use_secret_tokens,
+                    load_tokens=not self._use_secret_tokens,
+                    save_tokens=not self._use_secret_tokens,
+                )
+            )
             self._start_task.add_done_callback(self._on_client_stopped)
             self._loop_ready.set()
             self._loop.run_forever()
         except Exception as error:
-            self._set_status(self._friendly_error(error), running=False)
+            message = self._friendly_error(error)
+            logger.exception("Twitch background connection failed")
+            self._set_status(message, running=False)
         finally:
             if self._loop and not self._loop.is_closed():
-                pending = asyncio.all_tasks(self._loop)
+                try:
+                    self._loop.run_until_complete(self._close_client())
+                except Exception:
+                    logger.exception("Error closing TwitchIO client during shutdown")
+                pending = [
+                    task for task in asyncio.all_tasks(self._loop)
+                    if not task.done()
+                ]
                 for task in pending:
                     task.cancel()
                 if pending:
-                    self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+                self._loop.run_until_complete(self._loop.shutdown_default_executor())
+                # Let aiohttp finish closing its underlying transports before the
+                # owning event loop is torn down.
+                self._loop.run_until_complete(asyncio.sleep(0.2))
                 self._loop.close()
-            if self.status in {"Starting Twitch connection…", "Connected to Twitch chat"}:
-                self._set_status("Disconnected", running=False)
+            if self.status == "Starting Twitch connection…":
+                self._set_status("Twitch connection stopped unexpectedly.", running=False)
+            self._client = None
+            self._loop = None
+            self._start_task = None
+
+    async def _close_client(self):
+        """Close TwitchIO's aiohttp/websocket sessions on their owning loop."""
+        if self._client is not None and not self._client_closed:
+            await self._client.close()
+            self._client_closed = True
+            await asyncio.sleep(0.2)
 
     def _on_client_stopped(self, task):
         if task.cancelled():
             return
         error = task.exception()
         if error:
-            self._set_status(self._friendly_error(error), running=False)
+            message = self._friendly_error(error)
+            logger.error("TwitchIO client task stopped: %s", message)
+            self._set_status(message, running=False)
         else:
-            self._set_status("Twitch connection closed.", running=False)
-        if self._loop and self._loop.is_running():
+            if not self._stop_requested:
+                self._set_status("Twitch connection closed.", running=False)
+        if self._loop and self._loop.is_running() and not self._stop_requested:
             self._loop.call_soon(self._loop.stop)
 
     async def _prepare_channel(self):
         await asyncio.wait_for(self._client.wait_until_ready(), timeout=30)
+        if self._use_secret_tokens:
+            await self._client.add_token(
+                self._secret_access_token, self._secret_refresh_token
+            )
         channel = await self._client.fetch_user(login=self._target_channel)
         if channel is None:
             raise ValueError("That Twitch channel was not found. Check the channel name and try again.")
@@ -228,22 +320,40 @@ class TwitchChatManager:
             return "Twitch denied chat access. Reauthorize and grant the user:read:chat permission."
         if "port" in lowered or "address already in use" in lowered:
             return "Twitch's local OAuth listener could not start. Close another app using port 4343 and retry."
-        return f"Twitch connection error: {message[:220]}"
+        if "invalid client" in lowered or "client id" in lowered:
+            return "Twitch rejected the client credentials. Verify TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET."
+        return f"Twitch connection error: {message[:350]}"
 
     def stop(self):
         """Close the TwitchIO client and its background event loop safely."""
         loop = self._loop
-        client = self._client
-        if loop and loop.is_running() and client:
-            try:
-                asyncio.run_coroutine_threadsafe(client.close(), loop).result(timeout=10)
-            except Exception:
-                pass
+        close_error = None
+        self._stop_requested = True
+        if loop and loop.is_running():
+            if self._client:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._close_client(), loop
+                    ).result(timeout=15)
+                except Exception as error:
+                    close_error = error
+                    logger.exception("TwitchIO client close failed")
             loop.call_soon_threadsafe(loop.stop)
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=5)
-        self._set_status("Disconnected", running=False)
+            thread.join(timeout=15)
+        if thread and thread.is_alive():
+            self._set_status("Twitch is still shutting down; please wait before reconnecting.", running=False)
+            return
+        if close_error:
+            self._set_status(
+                f"Twitch disconnected, but session cleanup reported: {str(close_error)[:220]}",
+                running=False,
+            )
+        elif self.status.startswith("Twitch connection error:"):
+            self._set_status(self.status, running=False)
+        else:
+            self._set_status("Disconnected", running=False)
         self._client = None
         self._loop = None
         self._thread = None

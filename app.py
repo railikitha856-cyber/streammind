@@ -235,7 +235,14 @@ with st.sidebar:
     with disconnect_col:
         if st.button("Disconnect", use_container_width=True, disabled=not twitch_manager.running):
             twitch_manager.stop()
-    st.caption(twitch_manager.status)
+    if not (
+        twitch_manager.status == "Disconnected"
+        or twitch_manager.status.startswith(("Starting Twitch", "Connected to @", "Channel @"))
+        or "Authorize Twitch chat access" in twitch_manager.status
+    ):
+        st.error(twitch_manager.status)
+    else:
+        st.caption(twitch_manager.status)
     if "Authorize Twitch chat access" in twitch_manager.status:
         st.link_button(
             "Authorize Twitch chat reader",
